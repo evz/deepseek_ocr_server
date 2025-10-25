@@ -19,7 +19,7 @@ fi
 
 # Determine PyTorch index URL based on CUDA version
 if [[ "$CUDA_VERSION" == "13"* ]] || [[ "$CUDA_VERSION" == "12"* ]]; then
-    TORCH_INDEX="https://download.pytorch.org/whl/cu124"
+    TORCH_INDEX="https://download.pytorch.org/whl/cu128"
     echo "  Using PyTorch cu124 build (compatible with CUDA 12.x and 13.x)"
 elif [[ "$CUDA_VERSION" == "11.8"* ]]; then
     TORCH_INDEX="https://download.pytorch.org/whl/cu118"
