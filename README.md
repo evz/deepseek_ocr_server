@@ -43,7 +43,7 @@ python server.py --host 0.0.0.0 --port 5555
 ```
 
 The server will:
-- Load the model into GPU memory (~8GB VRAM)
+- Load the model into GPU memory (~9.5GB VRAM)
 - Start listening on port 5555
 - Process incoming OCR requests
 
