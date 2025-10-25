@@ -34,7 +34,7 @@ pip install -r requirements.txt
 python download_model.py
 ```
 
-This downloads the DeepSeek-OCR model from HuggingFace (~3.5GB).
+This downloads the DeepSeek-OCR model from HuggingFace (~7GB).
 
 ### 3. Start the Server
 
@@ -63,7 +63,7 @@ import io
 # Connect to server
 context = zmq.Context()
 socket = context.socket(zmq.REQ)
-socket.connect("tcp://192.168.1.234:5555")
+socket.connect("tcp://localhost:5555")
 
 # Load and encode image
 image = Image.open("document.jpg")
