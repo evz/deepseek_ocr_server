@@ -41,6 +41,7 @@ class DeepSeekOCRServer:
         - "directly resize"
         - "====================="
         - "BASE:  torch.Size([1, 100, 1280])"
+        - "PATCHES:  torch.Size([6, 100, 1280])"
         - "NO PATCHES"
         """
         lines = raw_output.split('\n')
@@ -51,6 +52,7 @@ class DeepSeekOCRServer:
             # Skip debug lines
             if (line_stripped in ('directly resize', 'NO PATCHES', '=====================') or
                 line_stripped.startswith('BASE:') or
+                line_stripped.startswith('PATCHES:') or
                 line_stripped.startswith('torch.Size')):
                 continue
             filtered_lines.append(line)
