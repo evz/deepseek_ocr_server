@@ -1,0 +1,24 @@
+# DeepSeek-OCR Server Requirements (desktop with RTX 5090)
+#
+# For client-only installation (laptop), use requirements-client.txt instead
+#
+# INSTALLATION ORDER MATTERS:
+# 1. Install PyTorch first (see install.sh or README)
+# 2. Install this requirements.txt
+# 3. Install flash-attn separately
+
+# Client dependencies (needed on server too)
+pyzmq>=25.0.0
+pillow>=10.0.0
+
+# Server-only dependencies
+# NOTE: Install PyTorch FIRST before running this file
+# See install.sh or README.md for correct installation order
+transformers==4.46.3
+tokenizers==0.20.3
+PyMuPDF
+img2pdf
+einops
+easydict
+addict
+numpy
