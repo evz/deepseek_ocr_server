@@ -29,9 +29,49 @@ class DeepSeekOCRServer:
         self.model_path = model_path
         self.device = device
         self.model = None
+        # Reclaim cached blocks once unused-but-reserved VRAM exceeds this.
+        self.cache_release_threshold_bytes = 4 * 1024 ** 3
 
         logging.info(f"Initializing DeepSeek-OCR server on {device}")
         self._load_model()
+
+    def _vram_stats(self) -> Dict[str, Any]:
+        """Live VRAM figures, so a caller can tell a real leak from the
+        allocator merely caching.
+
+        These are different problems with different fixes, and nvidia-smi
+        cannot distinguish them - it reports reserved memory, which grows
+        to a high-water mark by design and never shrinks on its own.
+        `allocated` is memory held by live tensors: if that climbs across
+        requests, something is genuinely being retained. If `allocated`
+        stays flat while `reserved` grows, it is fragmentation from this
+        workload's constantly-varying crop sizes and generation lengths -
+        expected, bounded, and reclaimable with empty_cache().
+        """
+        if self.device != 'cuda' or not torch.cuda.is_available():
+            return {}
+        return {
+            'vram_allocated_mb': round(torch.cuda.memory_allocated() / 1024 ** 2, 1),
+            'vram_reserved_mb': round(torch.cuda.memory_reserved() / 1024 ** 2, 1),
+            'vram_max_allocated_mb': round(torch.cuda.max_memory_allocated() / 1024 ** 2, 1),
+        }
+
+    def _release_cache_if_needed(self):
+        """Hands cached-but-unused blocks back when fragmentation overhead
+        grows large.
+
+        Only the gap between reserved and allocated is reclaimable, so this
+        triggers on that gap rather than on a request count - a run of
+        similarly-sized crops needs no releasing at all, while a run of
+        wildly differing ones does. empty_cache() forces a synchronise, so
+        it is not something to do on every request.
+        """
+        if self.device != 'cuda' or not torch.cuda.is_available():
+            return
+        overhead = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        if overhead > self.cache_release_threshold_bytes:
+            torch.cuda.empty_cache()
+            logging.info(f"Released {overhead / 1024 ** 3:.1f} GiB of cached VRAM")
 
     def _filter_debug_output(self, raw_output: str) -> str:
         """
@@ -227,17 +267,27 @@ class DeepSeekOCRServer:
                 sys.stdout = io.StringIO()
 
                 try:
-                    self.model.infer(
-                        self.tokenizer,
-                        prompt=prompt,
-                        image_file=tmp_path,
-                        output_path=output_dir,
-                        base_size=config['base_size'],
-                        image_size=config['image_size'],
-                        crop_mode=config['crop_mode'],
-                        save_results=False,
-                        test_compress=False
-                    )
+                    # model.eval() does not disable gradient tracking - it
+                    # only switches dropout/batchnorm to eval behaviour. HF's
+                    # generate() carries its own no_grad, but infer() also
+                    # runs the vision encoder before generating, and nothing
+                    # here guaranteed that forward pass wasn't building an
+                    # autograd graph and holding activations alive. This is
+                    # a serving process that never calls backward, so
+                    # inference_mode is correct unconditionally and costs
+                    # nothing.
+                    with torch.inference_mode():
+                        self.model.infer(
+                            self.tokenizer,
+                            prompt=prompt,
+                            image_file=tmp_path,
+                            output_path=output_dir,
+                            base_size=config['base_size'],
+                            image_size=config['image_size'],
+                            crop_mode=config['crop_mode'],
+                            save_results=False,
+                            test_compress=False
+                        )
 
                     # Get the captured output and filter debug lines
                     raw_output = sys.stdout.getvalue()
@@ -261,6 +311,7 @@ class DeepSeekOCRServer:
                     'base_size': config['base_size'],
                     'image_size': config['image_size'],
                     'crop_mode': config['crop_mode'],
+                    **self._vram_stats(),
                     # Echoed so a caller can tell an applied bound from an
                     # ignored one - the previous protocol silently dropped
                     # unknown keys, which made that indistinguishable.
@@ -272,6 +323,7 @@ class DeepSeekOCRServer:
 
         finally:
             self._generation_overrides = {}
+            self._release_cache_if_needed()
             # Clean up temp file
             Path(tmp_path).unlink(missing_ok=True)
 
