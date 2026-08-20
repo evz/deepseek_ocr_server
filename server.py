@@ -383,7 +383,20 @@ def main():
                 response = json.dumps(result)
                 socket.send_string(response)
 
-                logging.info(f"Request #{request_count} completed in {result['metadata']['processing_time_ms']}ms")
+                # VRAM goes in the log line, not just the response metadata:
+                # the thing being watched for is drift across many requests,
+                # which is only visible as a series. `allocated` climbing
+                # means tensors are being retained; `allocated` flat while
+                # `reserved` climbs is the caching allocator reaching its
+                # high-water mark, which is expected and plateaus.
+                meta = result['metadata']
+                vram = ""
+                if 'vram_allocated_mb' in meta:
+                    vram = (f", vram alloc={meta['vram_allocated_mb']:.0f}MB "
+                            f"reserved={meta['vram_reserved_mb']:.0f}MB "
+                            f"peak={meta['vram_max_allocated_mb']:.0f}MB")
+                logging.info(
+                    f"Request #{request_count} completed in {meta['processing_time_ms']}ms{vram}")
 
             except Exception as e:
                 logging.error(f"Error processing request: {e}", exc_info=True)
