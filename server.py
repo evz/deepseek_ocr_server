@@ -72,6 +72,30 @@ class DeepSeekOCRServer:
                 local_files_only=True  # Don't download, use cached only
             )
 
+            # DeepSeek-OCR's tokenizer_config.json declares these two only
+            # in `added_tokens_decoder` and never sets the top-level
+            # `eos_token`/`pad_token` fields, so `tokenizer.eos_token_id`
+            # comes back None. That matters because the model's own
+            # infer() passes it straight through as
+            # `generate(eos_token_id=tokenizer.eos_token_id, ...)` - a None
+            # there leaves generation with no stopping criterion, so every
+            # request runs to the hardcoded max_new_tokens=8192 instead of
+            # stopping when the page is transcribed. Combined with infer()'s
+            # `no_repeat_ngram_size=20` (which forbids repeating any
+            # 20-token span, so the model cannot idle by repeating itself)
+            # the tail past the real content comes back as *novel*
+            # hallucinated filler: incrementing number runs, endless LaTeX
+            # `\begin{array}{cccc...}` padding, or restated garbage lines.
+            # Setting the tokens restores early stopping.
+            if self.tokenizer.eos_token_id is None:
+                self.tokenizer.eos_token = '<｜end▁of▁sentence｜>'
+            if self.tokenizer.pad_token_id is None:
+                self.tokenizer.pad_token = '<｜▁pad▁｜>'
+            logging.info(
+                f"Tokenizer special tokens: eos_token_id={self.tokenizer.eos_token_id}, "
+                f"pad_token_id={self.tokenizer.pad_token_id}"
+            )
+
             self.model = AutoModel.from_pretrained(
                 model_name,
                 _attn_implementation='flash_attention_2',
@@ -89,6 +113,15 @@ class DeepSeekOCRServer:
             raise SystemExit(1)
 
         self.model = self.model.eval()
+
+        # infer() never passes pad_token_id, so generate() falls back to
+        # the generation config; seeding it here keeps that fallback from
+        # resolving to None as well.
+        if getattr(self.model, 'generation_config', None) is not None:
+            if self.model.generation_config.eos_token_id is None:
+                self.model.generation_config.eos_token_id = self.tokenizer.eos_token_id
+            if self.model.generation_config.pad_token_id is None:
+                self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
 
         logging.info("Model loaded successfully")
 
