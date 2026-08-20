@@ -75,18 +75,18 @@ class DeepSeekOCRServer:
             # DeepSeek-OCR's tokenizer_config.json declares these two only
             # in `added_tokens_decoder` and never sets the top-level
             # `eos_token`/`pad_token` fields, so `tokenizer.eos_token_id`
-            # comes back None. That matters because the model's own
-            # infer() passes it straight through as
-            # `generate(eos_token_id=tokenizer.eos_token_id, ...)` - a None
-            # there leaves generation with no stopping criterion, so every
-            # request runs to the hardcoded max_new_tokens=8192 instead of
-            # stopping when the page is transcribed. Combined with infer()'s
-            # `no_repeat_ngram_size=20` (which forbids repeating any
-            # 20-token span, so the model cannot idle by repeating itself)
-            # the tail past the real content comes back as *novel*
-            # hallucinated filler: incrementing number runs, endless LaTeX
-            # `\begin{array}{cccc...}` padding, or restated garbage lines.
-            # Setting the tokens restores early stopping.
+            # comes back None and infer() forwards that None into
+            # `generate(eos_token_id=...)`, which is what emits the
+            # "pad token id ... :None" warning at inference time.
+            #
+            # Setting them is correct hygiene, but measured against real
+            # runaway crops it changed nothing: byte-identical output
+            # before and after. The reason is that a stopping criterion
+            # only helps if the model actually emits EOS, and in the
+            # runaway case it never does - it hits the hardcoded
+            # max_new_tokens=8192 instead (a crop that degenerated into
+            # counting stopped at exactly ~8192 tokens' worth of numbers).
+            # See the generate() wrapper below for what does bound it.
             if self.tokenizer.eos_token_id is None:
                 self.tokenizer.eos_token = '<｜end▁of▁sentence｜>'
             if self.tokenizer.pad_token_id is None:
@@ -123,7 +123,46 @@ class DeepSeekOCRServer:
             if self.model.generation_config.pad_token_id is None:
                 self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
 
+        self._install_generate_bounds()
+
         logging.info("Model loaded successfully")
+
+    def _install_generate_bounds(self):
+        """Let a request bound its own generation length.
+
+        infer() hardcodes `max_new_tokens=8192` and accepts no override, so
+        the only place to intervene is generate() itself. This matters
+        because 8192 is not a safety net here - it is the *only* thing that
+        stops a degenerate run. On a dense-table crop the model can enter a
+        loop that emits novel-but-meaningless tokens (an incrementing
+        number run was measured going 1445 -> 4166), and because infer()
+        also sets `no_repeat_ngram_size=20`, counting upward never trips
+        the repeat check, so the loop sustains itself until the cap. The
+        model never emits EOS in that state, so setting eos_token_id does
+        not help - the run simply burns the full budget, taking ~150s and
+        provoking transformers' "will exceed the model's predefined
+        maximum length (8192)" warning.
+
+        A caller that knows roughly how much text its crop contains (say a
+        dozen table rows) can pass a much smaller `max_new_tokens`, which
+        converts a 150-second runaway into a fast, cheap, obviously-
+        truncated response the caller can detect and retry. Requests that
+        say nothing keep the original 8192 behaviour.
+        """
+        self._generation_overrides = {}
+        original_generate = self.model.generate
+
+        def bounded_generate(*args, **kwargs):
+            overrides = self._generation_overrides
+            cap = overrides.get('max_new_tokens')
+            if cap is not None:
+                kwargs['max_new_tokens'] = min(int(cap), kwargs.get('max_new_tokens', 8192))
+            penalty = overrides.get('repetition_penalty')
+            if penalty is not None:
+                kwargs['repetition_penalty'] = float(penalty)
+            return original_generate(*args, **kwargs)
+
+        self.model.generate = bounded_generate
 
     def process_image(self, image_data: bytes, params: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -147,6 +186,15 @@ class DeepSeekOCRServer:
             # Extract parameters
             mode = params.get('mode', 'base')
             preserve_layout = params.get('preserve_layout', True)
+
+            # Per-request generation bounds, applied by the generate()
+            # wrapper installed at load time. Absent keys leave the
+            # model's own hardcoded defaults alone.
+            self._generation_overrides = {
+                key: params[key]
+                for key in ('max_new_tokens', 'repetition_penalty')
+                if params.get(key) is not None
+            }
 
             # Map mode to DeepSeek-OCR parameters
             # Tiny: base_size = 512, image_size = 512, crop_mode = False
@@ -212,13 +260,18 @@ class DeepSeekOCRServer:
                     'device': self.device,
                     'base_size': config['base_size'],
                     'image_size': config['image_size'],
-                    'crop_mode': config['crop_mode']
+                    'crop_mode': config['crop_mode'],
+                    # Echoed so a caller can tell an applied bound from an
+                    # ignored one - the previous protocol silently dropped
+                    # unknown keys, which made that indistinguishable.
+                    'generation_overrides': dict(self._generation_overrides)
                 }
             }
 
             return result
 
         finally:
+            self._generation_overrides = {}
             # Clean up temp file
             Path(tmp_path).unlink(missing_ok=True)
 
