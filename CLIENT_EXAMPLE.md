@@ -249,6 +249,20 @@ print(f"Total: {total_chars} characters")
 
 ## Error Handling
 
+Errors arrive as a normal response with an `error` key, not as an exception —
+including the case where a worker process dies mid-request (the broker
+answers on its behalf rather than leaving you to time out):
+
+```python
+result = client.process_image("document.jpg")
+if result.get('error'):
+    print(f"Server-side failure: {result['error']}")
+else:
+    print(result['text'])
+```
+
+Timeouts are different: those surface as `zmq.Again` from the socket.
+
 ```python
 import zmq
 
@@ -277,53 +291,119 @@ except TimeoutError:
     print("Document too complex, try splitting into regions")
 ```
 
-## Async Processing (Optional)
+## Concurrent Processing
 
-For high-throughput applications:
+The server runs several model replicas, so it can handle more than one
+request at a time — but **a single `REQ` socket cannot drive that**. `REQ` is
+lockstep by design: it refuses to send a second request until the first has
+been answered. One socket therefore gives you one request in flight no matter
+how many workers are running.
+
+To use the pool, open one socket per in-flight request:
 
 ```python
-import asyncio
-import zmq.asyncio
+import base64, json, threading, zmq
+from pathlib import Path
+from queue import Queue, Empty
 
-class AsyncDeepSeekOCRClient:
-    def __init__(self, host="localhost", port=5555):
-        self.context = zmq.asyncio.Context()
-        self.socket = self.context.socket(zmq.REQ)
-        self.socket.connect(f"tcp://{host}:{port}")
 
-    async def process_image(self, image_path, mode="base"):
-        # Same encoding logic as before
-        image = Image.open(image_path)
-        buffer = io.BytesIO()
-        image.save(buffer, format='PNG')
-        image_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+def process_concurrent(image_paths, concurrency=4, host="localhost",
+                       port=5555, mode="base", timeout=600000):
+    """Process images across `concurrency` sockets. Returns {path: result}.
 
-        request = {
-            'image': image_b64,
-            'mode': mode,
-            'preserve_layout': True
-        }
+    Match `concurrency` to the server's --workers; going higher just queues
+    requests in the broker, which is harmless but buys nothing.
+    """
+    queue = Queue()
+    for path in image_paths:
+        queue.put(Path(path))
 
-        await self.socket.send_string(json.dumps(request))
-        response_str = await self.socket.recv_string()
-        return json.loads(response_str)
+    results, lock = {}, threading.Lock()
+    context = zmq.Context.instance()
+
+    def run():
+        socket = context.socket(zmq.REQ)
+        socket.setsockopt(zmq.RCVTIMEO, timeout)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.connect(f"tcp://{host}:{port}")
+        try:
+            while True:
+                try:
+                    path = queue.get_nowait()
+                except Empty:
+                    return
+                request = {
+                    'image': base64.b64encode(path.read_bytes()).decode('ascii'),
+                    'mode': mode,
+                    'preserve_layout': True,
+                }
+                try:
+                    socket.send_string(json.dumps(request))
+                    response = json.loads(socket.recv_string())
+                except zmq.ZMQError as exc:
+                    response = {'error': str(exc), 'text': ''}
+                with lock:
+                    results[path] = response
+        finally:
+            socket.close()
+
+    threads = [threading.Thread(target=run) for _ in range(concurrency)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
 
 
 # Usage
-async def main():
-    client = AsyncDeepSeekOCRClient(host="localhost")
-
-    tasks = [
-        client.process_image(f"page_{i}.jpg")
-        for i in range(10)
-    ]
-
-    results = await asyncio.gather(*tasks)
-    print(f"Processed {len(results)} images")
-
-
-asyncio.run(main())
+results = process_concurrent(Path("documents").glob("*.jpg"), concurrency=4)
+for path, result in results.items():
+    if result.get('error'):
+        print(f"{path.name}: FAILED - {result['error']}")
+    else:
+        Path(path).with_suffix('.txt').write_text(result['text'])
 ```
+
+### asyncio
+
+The same rule applies: one `REQ` socket per concurrent request.
+
+```python
+import asyncio, base64, json
+import zmq, zmq.asyncio
+
+
+async def process_one(context, path, host="localhost", port=5555, mode="base"):
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.LINGER, 0)
+    socket.connect(f"tcp://{host}:{port}")
+    try:
+        await socket.send_string(json.dumps({
+            'image': base64.b64encode(path.read_bytes()).decode('ascii'),
+            'mode': mode,
+            'preserve_layout': True,
+        }))
+        return json.loads(await socket.recv_string())
+    finally:
+        socket.close()
+
+
+async def main(paths, concurrency=4):
+    context = zmq.asyncio.Context()
+    limit = asyncio.Semaphore(concurrency)
+
+    async def bounded(path):
+        async with limit:
+            return await process_one(context, path)
+
+    results = await asyncio.gather(*(bounded(p) for p in paths))
+    context.term()
+    return results
+```
+
+Note the semaphore: without it, a thousand images means a thousand sockets
+opened at once. The server queues whatever it cannot start immediately, so
+there is no benefit to exceeding the worker count.
 
 ## Integration with Existing OCR Pipeline
 
@@ -346,7 +426,11 @@ tables = [e for e in elements if e['type'] == 'table']
 
 ## Performance Tips
 
-1. **Reuse the client connection**:
+1. **Use one socket per concurrent request**: a single `REQ` socket is
+   lockstep, so it cannot use more than one of the server's workers. See
+   [Concurrent Processing](#concurrent-processing) above.
+
+2. **Reuse the client connection**:
    ```python
    # Good: One connection for many requests
    client = DeepSeekOCRClient(...)
@@ -361,17 +445,28 @@ tables = [e for e in elements if e['type'] == 'table']
        client.close()
    ```
 
-2. **Choose the right mode**:
+3. **Choose the right mode**:
    - `small` for speed (2s/page)
    - `base` for quality (18s/page)
    - `gundam` for high-DPI archival documents (38s/page)
 
-3. **Increase timeout for large images**:
+4. **Increase timeout for large images**:
    ```python
    client = DeepSeekOCRClient(timeout=600000)  # 10 minutes
    ```
 
-4. **Pre-process images**:
+   Or bound the work instead of waiting for it. If you know roughly how much
+   text a crop holds, `max_new_tokens` turns a degenerate 150-second runaway
+   into a fast, obviously-truncated response you can detect and retry:
+
+   ```python
+   request = {'image': image_b64, 'mode': 'base', 'max_new_tokens': 512}
+   ```
+
+   The server echoes what it applied in `metadata['generation_overrides']`,
+   so you can tell an applied bound from an ignored one.
+
+5. **Pre-process images**:
    - Convert to PNG or high-quality JPEG
    - Don't downscale before sending (let the server handle it)
    - For very large images (>10MB), consider tiling on client side
