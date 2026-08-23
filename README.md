@@ -117,10 +117,12 @@ workers are running. To actually use the pool, open several sockets — see
 
 `--workers auto` (the default) divides free VRAM by ~9.6GB per replica and
 caps the result at 4. That is an estimate, not a measurement, so confirm it
-against your own documents:
+against real pages. A sample set ships with the repo:
 
 ```bash
-python bench.py --images scans/ --concurrency 1,2,4,8 --warmup
+unzip testdata/bevreg-5007-298-sample.zip -d testdata/
+python bench.py --images testdata/bevreg-5007-298-sample \
+    --concurrency 1,2,4,8 --repeat 3 --warmup
 ```
 
 Throughput that stops rising with concurrency means the pool is saturated.
@@ -310,10 +312,35 @@ The inference path changed, so if you want proof the text did not:
 
 ```bash
 python server.py --streaming-path &        # original path
-python bench.py --images scans/ --concurrency 1 --save-dir out-old
+python bench.py --images testdata/bevreg-5007-298-sample \
+    --concurrency 1 --save-dir out-old
 # restart the server without --streaming-path
-python bench.py --images scans/ --concurrency 1 --save-dir out-new
+python bench.py --images testdata/bevreg-5007-298-sample \
+    --concurrency 1 --save-dir out-new
 diff -r out-old out-new
+```
+
+## Test Data
+
+`testdata/bevreg-5007-298-sample.zip` holds 30 scanned pages (22MB) for
+benchmarking, sampled evenly across the five parts of Amsterdam
+bevolkingsregister inventory 5007, access 298. They are the embedded JPEGs
+copied out of the source PDFs verbatim — no re-encoding or resampling — so
+the server sees exactly what the archive scanned.
+
+The spread is deliberate. Decode time tracks how much *text* is on a page,
+not how large the image is, so a benchmark set has to span the range: these
+run from printed prose through to dense numeric register tables, the latter
+being the pages that provoke the runaway generations `max_new_tokens` exists
+to bound. Benchmarking on sparse pages alone will tell you the worker pool is
+saturated when it is not.
+
+`MANIFEST.txt` inside the zip records which PDF and page each image came
+from, and `extract_sample.py` regenerates the set (or a larger one) from the
+source PDFs:
+
+```bash
+python extract_sample.py /path/to/pdfs ./out --pages 60
 ```
 
 ## Troubleshooting

@@ -8,15 +8,16 @@ Two things this is for:
    throughput on your GPU; guessing from VRAM alone gets you close, this
    tells you the answer. Sweep it:
 
-       python bench.py --images scans/ --concurrency 1,2,4,8
+       python bench.py --images testdata/bevreg-5007-298-sample \\
+              --concurrency 1,2,4,8 --repeat 3 --warmup
 
 2. Proving an optimisation did not change the output. Dump results from two
    server configurations and diff them:
 
        python server.py --streaming-path &     # original inference path
-       python bench.py --images scans/ --concurrency 1 --save-dir out-old
+       python bench.py --images IMAGES --concurrency 1 --save-dir out-old
        # restart the server without --streaming-path
-       python bench.py --images scans/ --concurrency 1 --save-dir out-new
+       python bench.py --images IMAGES --concurrency 1 --save-dir out-new
        diff -r out-old out-new
 
 Concurrency here means "how many client sockets are in flight at once". A
